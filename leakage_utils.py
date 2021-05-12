@@ -35,12 +35,23 @@ class DLGNet(nn.Module):
         out = self.fc(out)
         return out
 
+# initialize device with larger weights than pytorch default
+def weights_init(model, minval, maxval):
+    if hasattr(model, "weight"):
+        model.weight.data.uniform_(minval, maxval)
+    if hasattr(model, "bias") and model.bias is not None:
+        model.bias.data.uniform_(minval, maxval)
+
 # given a class number c, output a onehot label with length num_classes
 def label_to_onehot(c, num_classes=10):
     target = torch.unsqueeze(c, 1)
     onehot_target = torch.zeros(target.size(0), num_classes, device=target.device)
     onehot_target.scatter_(1, target, 1)
     return onehot_target
+
+# loss for onehot vector
+def cross_entropy_for_onehot(pred, target):
+    return torch.mean(torch.sum(- target * F.log_softmax(pred, dim=-1), 1))
 
 # get a random image, label pair with the dimensions of CIFAR data
 def get_random_pair():
