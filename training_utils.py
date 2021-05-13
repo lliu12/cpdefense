@@ -156,7 +156,7 @@ def train(epoch, device, net):
     device['train_acc_tracker'].append(acc)
     sys.stdout.flush()
 
-def test(epoch, device, net):
+def test(epoch, device, net, testloader):
     criterion = nn.CrossEntropyLoss()
     net.eval()
     test_loss, correct, total = 0, 0, 0

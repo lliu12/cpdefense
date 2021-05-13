@@ -2,6 +2,7 @@ import time
 import copy
 import sys
 import random
+import math
 from collections import OrderedDict
 import torch
 import torch.nn as nn
@@ -42,7 +43,7 @@ class DLGNet(nn.Module):
         return out
 
 # initialize device with larger weights than pytorch default
-def weights_init(model, minval, maxval):
+def weights_init(model, minval=-.5, maxval=.5):
     if hasattr(model, "weight"):
         model.weight.data.uniform_(minval, maxval)
     if hasattr(model, "bias") and model.bias is not None:
@@ -73,7 +74,7 @@ def plot_history(history):
   for i in range(len(history)):
       plt.subplot(3, 10, i + 1)
       plt.imshow(np.transpose(history[i], (1, 2, 0)).numpy())
-      plt.title("iter=%d" % (i * 10))
+      plt.title("iter=%d" % (i * 10 + 9))
       plt.axis('off')
   plt.show()
 
@@ -138,7 +139,6 @@ def init_empty_gradient(device_gradients):
     return []
   empty_grad = []
   for dg in device_gradients[0]['orig_grad']:
-    print(dg)
     empty_grad.append(torch.zeros(dg.shape).cuda())
   return empty_grad
 
@@ -154,4 +154,158 @@ def get_cluster_gradients(device_gradients, clusters):
         scaled_grad = d_layer / device_gradients[d]['group_size']
         cluster_grads[c][layer_num] = torch.add(cluster_grads[c][layer_num], scaled_grad)
   return cluster_grads
+
+mse_loss = torch.nn.MSELoss()
+# calculate peak signal to noise ratio
+def psnr(im1, im2, max_value = 1):
+  mse = mse_loss(im1, im2).detach().numpy()
+  return 10 * np.log10(max_value * max_value / mse)
+
+# # adds a pruned_gradient key to the dictionaries in device_gradients
+# # representing the pruned gradient for that device using the clustered pruning method
+# # optional amplify factor will just multiply the gradients to scale them up
+def add_pruned_gradients(device_gradients, clusters, overlap_factor, amplify_factor = 1, for_attack = False):
+  gradient_type = 'pruned_grad_for_attack' if for_attack else 'pruned_grad'
+  num_devices = len(device_gradients)
+  # iterate through clusters
+  for c in clusters.keys():
+    cluster_size = len(clusters[c])
+    if overlap_factor > cluster_size:
+      for i in range(len(clusters[c])):
+        d = clusters[c][i]
+        # make a copy of the true gradient
+        pruned_grad = copy.deepcopy(device_gradients[d]['orig_grad'])
+        # prune this copy and store pruned version in the dict
+        for k, layer in enumerate(pruned_grad):
+          start = math.ceil((i)*(float(layer.shape[0])/float(cluster_size)) - 0.0001)
+          end = math.floor((i+1)*(float(layer.shape[0])/float(cluster_size)) + 0.0001)
+          layer[0:start] = 0
+          layer[start:end] = layer[start:end] * amplify_factor
+          layer[end+1:] = 0
+        device_gradients[d]['gradient_multiplier'] = cluster_size/num_devices
+        device_gradients[d][gradient_type] = pruned_grad
+        device_gradients[d]['group_size'] = 1
+        device_gradients[d]['start_end_numerator'] = i
+        device_gradients[d]['start_end_denominator'] = float(cluster_size)
+    else:
+      num_groups = math.ceil(cluster_size/overlap_factor) 
+      for g in range(num_groups):
+        group = clusters[c][g*overlap_factor:(g+1)*overlap_factor]
+        group_size = len(group)
+        for d in group:
+          pruned_grad = copy.deepcopy(device_gradients[d]['orig_grad'])
+          for k, layer in enumerate(pruned_grad):
+            start = math.ceil((g)*(float(layer.shape[0])/float(num_groups)) - 0.0001)
+            end = math.floor((g+1)*(float(layer.shape[0])/float(num_groups)) + 0.0001)
+            layer[0:start] = 0
+            layer[start:end] = layer[start:end] * amplify_factor
+            layer[end+1:] = 0
+          device_gradients[d]['gradient_multiplier'] = (cluster_size/num_devices)/group_size
+          device_gradients[d][gradient_type] = pruned_grad
+          device_gradients[d]['group_size'] = group_size
+          device_gradients[d]['start_end_numerator'] = g
+          device_gradients[d]['start_end_denominator'] = float(num_groups)
+
+# initialize list of 0-tensors in shape of gradient
+def init_empty_gradient(device_gradients):
+  if len(device_gradients) == 0:
+    print("No device gradients to match shape to...")
+    return []
+  empty_grad = []
+  for dg in device_gradients[0]['orig_grad']:
+    empty_grad.append(torch.zeros(dg.shape).cuda())
+  return empty_grad
+
+# get gradient for a single cluster given by cluster_num
+def get_cluster_gradient(cluster_num, device_gradients, for_attack = False):
+  gradient_type = 'pruned_grad_for_attack' if for_attack else 'pruned_grad'
+  cluster_grad = init_empty_gradient(device_gradients)
+  for d in clusters[cluster_num]:
+    for layer_num, d_layer in enumerate(device_gradients[d][gradient_type]):
+        scaled_grad = d_layer / device_gradients[d]['group_size']
+        cluster_grad[layer_num] = torch.add(cluster_grad[layer_num], scaled_grad)
+  return cluster_grad
+
+
+# # creates a list of cluster gradients
+# # for each cluster, want to: iterate through the pruned gradients of devices in it
+# sum up pruned_grad divided by group_size for each device
+# for_attack: whether this clustering is for gradients from the random image used in the attack
+def get_cluster_gradients(device_gradients, clusters, for_attack = False):
+  gradient_type = 'pruned_grad_for_attack' if for_attack else 'pruned_grad'
+  cluster_grads = []
+  # cluster_grads = [init_empty_gradient(device_gradients) for _ in clusters]
+  for c in clusters.keys():
+    # for d in clusters[c]:
+    cluster_grads.append(get_cluster_gradient(c, device_gradients, for_attack = for_attack))
+      # for layer_num, d_layer in enumerate(device_gradients[d][gradient_type]):
+      #   scaled_grad = d_layer / device_gradients[d]['group_size']
+      #   cluster_grads[c][layer_num] = torch.add(cluster_grads[c][layer_num], scaled_grad)
+  return cluster_grads
+
+
+def prune_attack_gradients(device_gradients, cluster_items, overlap_factor, amplify_factor = 1):
+  gradient_type = 'pruned_grad_for_attack'
+  cluster_size = len(cluster_items)
+  num_devices = len(device_gradients)
+  # iterate through clusters
+  if overlap_factor > cluster_size:
+    for i in range(len(cluster_items)):
+      d = cluster_items[i]
+      # gradient
+      pruned_grad = device_gradients[d]['grad_for_attack'] # copy.deepcopy(device_gradients[d]['grad_for_attack'])
+      # prune it
+      for k, layer in enumerate(pruned_grad):
+        start = math.ceil((i)*(float(layer.shape[0])/float(cluster_size)) - 0.0001)
+        end = math.floor((i+1)*(float(layer.shape[0])/float(cluster_size)) + 0.0001)
+        layer[0:start] = layer[0:start] * 0
+        layer[start:end] = layer[start:end] * amplify_factor
+        layer[end+1:] = layer[end+1:] * 0
+      device_gradients[d]['gradient_multiplier'] = cluster_size/num_devices
+      device_gradients[d][gradient_type] = pruned_grad
+      device_gradients[d]['group_size'] = 1
+  else:
+    num_groups = math.ceil(cluster_size/overlap_factor) 
+    for g in range(num_groups):
+      group = cluster_items[g*overlap_factor:(g+1)*overlap_factor]
+      group_size = len(group)
+      for d in group:
+        pruned_grad = device_gradients[d]['grad_for_attack'] # copy.deepcopy(device_gradients[d]['grad_for_attack'])
+        for k, layer in enumerate(pruned_grad):
+          start = math.ceil((g)*(float(layer.shape[0])/float(num_groups)) - 0.0001)
+          end = math.floor((g+1)*(float(layer.shape[0])/float(num_groups)) + 0.0001)
+          layer[0:start] = layer[0:start] * 0
+          layer[start:end] = layer[start:end] * amplify_factor
+          layer[end+1:] = layer[end+1:] * 0
+        device_gradients[d]['gradient_multiplier'] = (cluster_size/num_devices)/group_size
+        device_gradients[d][gradient_type] = pruned_grad
+        device_gradients[d]['group_size'] = group_size
+
+# launch privacy attack on an individual device
+def try_recovery_individual(device, actual_grad, num_iters = 100, save_every = 10):
+  random_image, random_label = get_random_pair()
+  leakage_optimizer = torch.optim.LBFGS([random_image, random_label], lr = 1)
+  history = []
+  for iters in range(num_iters):
+
+    def closure():
+      leakage_optimizer.zero_grad()
+      dummy_pred = device['net'](torch.unsqueeze(random_image, dim = 0).cuda())
+      dummy_onehot_label = F.softmax(random_label, dim=-1).cuda()
+      dummy_loss = leakage_criterion(dummy_pred, dummy_onehot_label) 
+      dummy_grad = torch.autograd.grad(dummy_loss, device['net'].parameters(), create_graph = True)
+      grad_diff = 0
+      for gx, gy in zip(dummy_grad, actual_grad): 
+        grad_diff += ((gx - gy) ** 2).sum()
+      grad_diff.backward()
+      return grad_diff
+
+    leakage_optimizer.step(closure)
+    if (iters+1) % save_every == 0:
+      diff = closure()
+      # print(diff)
+      history.append(copy.deepcopy(random_image.cpu().detach()))
+  return random_image, random_label, history
+          
+
 
