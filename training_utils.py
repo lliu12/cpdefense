@@ -125,6 +125,7 @@ def cifar_noniid_group_test(dataset):
   return group_indices
 
 def train(epoch, device, net):
+    criterion = nn.CrossEntropyLoss()
     net.train()
     device['net'].train()
     train_loss, correct, total = 0, 0, 0
@@ -156,6 +157,7 @@ def train(epoch, device, net):
     sys.stdout.flush()
 
 def test(epoch, device, net):
+    criterion = nn.CrossEntropyLoss()
     net.eval()
     test_loss, correct, total = 0, 0, 0
     with torch.no_grad():
@@ -299,6 +301,7 @@ def get_devices_for_round_cluster(devices, device_pct, preds):
 
 # gets per-group accuracy of global model
 def test_group(epoch, device, group_idxs_dict, net):
+    criterion = nn.CrossEntropyLoss()
     num_groups = len(group_idxs_dict)
 
     # same testing/evaluation code from earlier, but adapted to support three groups
@@ -328,8 +331,10 @@ def test_group(epoch, device, group_idxs_dict, net):
     acc = [100.*correct[i] / total[i] for i in range(num_groups)]
     device['test_acc_tracker'].append(acc)
 
-def average_weights_cluster_overlap(devices,preds,overlap_factor):
-  num_devices = len(devices)
+
+# transform a list of devices' cluster identities into a dictionary where
+# keys = cluster nums, values = list of devices in that cluster
+def get_cluster_dict(preds):
   clusters = {}
   for i in range(len(preds)):
     if preds[i] in clusters.keys():
@@ -338,6 +343,11 @@ def average_weights_cluster_overlap(devices,preds,overlap_factor):
       clusters[preds[i]] = [i]
   for k in clusters.keys():
     random.shuffle(clusters[k])
+  return clusters
+
+def average_weights_cluster_overlap(devices,preds,overlap_factor):
+  num_devices = len(devices)
+  clusters = get_cluster_dict(preds)
   # initialize master dict to 0
   new_dict = devices[0]['net'].state_dict()
   for k in new_dict.keys():
