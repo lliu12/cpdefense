@@ -66,6 +66,7 @@ def get_random_pair():
 def imshow(img):
   npimg = img.numpy()   # convert from tensor
   plt.imshow(np.transpose(npimg, (1, 2, 0))) 
+  plt.axis('off')
   plt.show()
 
 # plot a series of images
@@ -142,19 +143,6 @@ def init_empty_gradient(device_gradients):
     empty_grad.append(torch.zeros(dg.shape).cuda())
   return empty_grad
 
-
-# creates a list of cluster gradients
-# for each cluster, want to: iterate through the pruned gradients of devices in it
-# sum up pruned_grad divided by group_size for each device
-def get_cluster_gradients(device_gradients, clusters):
-  cluster_grads = [init_empty_gradient(device_gradients) for _ in clusters]
-  for c in clusters:
-    for d in clusters[c]:
-      for layer_num, d_layer in enumerate(device_gradients[d]['pruned_grad']):
-        scaled_grad = d_layer / device_gradients[d]['group_size']
-        cluster_grads[c][layer_num] = torch.add(cluster_grads[c][layer_num], scaled_grad)
-  return cluster_grads
-
 mse_loss = torch.nn.MSELoss()
 # calculate peak signal to noise ratio
 def psnr(im1, im2, max_value = 1):
@@ -217,7 +205,7 @@ def init_empty_gradient(device_gradients):
   return empty_grad
 
 # get gradient for a single cluster given by cluster_num
-def get_cluster_gradient(cluster_num, device_gradients, for_attack = False):
+def get_cluster_gradient(cluster_num, device_gradients, clusters, for_attack = False):
   gradient_type = 'pruned_grad_for_attack' if for_attack else 'pruned_grad'
   cluster_grad = init_empty_gradient(device_gradients)
   for d in clusters[cluster_num]:
@@ -237,13 +225,14 @@ def get_cluster_gradients(device_gradients, clusters, for_attack = False):
   # cluster_grads = [init_empty_gradient(device_gradients) for _ in clusters]
   for c in clusters.keys():
     # for d in clusters[c]:
-    cluster_grads.append(get_cluster_gradient(c, device_gradients, for_attack = for_attack))
+    cluster_grads.append(get_cluster_gradient(c, device_gradients, clusters, for_attack = for_attack))
       # for layer_num, d_layer in enumerate(device_gradients[d][gradient_type]):
       #   scaled_grad = d_layer / device_gradients[d]['group_size']
       #   cluster_grads[c][layer_num] = torch.add(cluster_grads[c][layer_num], scaled_grad)
   return cluster_grads
 
 
+# difference from normal gradient pruning function: direct editing instead of deep copies
 def prune_attack_gradients(device_gradients, cluster_items, overlap_factor, amplify_factor = 1):
   gradient_type = 'pruned_grad_for_attack'
   cluster_size = len(cluster_items)
@@ -253,7 +242,7 @@ def prune_attack_gradients(device_gradients, cluster_items, overlap_factor, ampl
     for i in range(len(cluster_items)):
       d = cluster_items[i]
       # gradient
-      pruned_grad = device_gradients[d]['grad_for_attack'] # copy.deepcopy(device_gradients[d]['grad_for_attack'])
+      pruned_grad = device_gradients[d]['grad_for_attack']
       # prune it
       for k, layer in enumerate(pruned_grad):
         start = math.ceil((i)*(float(layer.shape[0])/float(cluster_size)) - 0.0001)
@@ -270,7 +259,7 @@ def prune_attack_gradients(device_gradients, cluster_items, overlap_factor, ampl
       group = cluster_items[g*overlap_factor:(g+1)*overlap_factor]
       group_size = len(group)
       for d in group:
-        pruned_grad = device_gradients[d]['grad_for_attack'] # copy.deepcopy(device_gradients[d]['grad_for_attack'])
+        pruned_grad = device_gradients[d]['grad_for_attack']
         for k, layer in enumerate(pruned_grad):
           start = math.ceil((g)*(float(layer.shape[0])/float(num_groups)) - 0.0001)
           end = math.floor((g+1)*(float(layer.shape[0])/float(num_groups)) + 0.0001)
